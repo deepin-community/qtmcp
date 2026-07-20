@@ -1,4 +1,9 @@
 #!/usr/bin/make -f
 
 %:
-	dh $@
+	dh $@ --buildsystem=cmake
+
+override_dh_auto_configure:
+	dh_auto_configure -- \
+		-DQT_BUILD_EXAMPLES=ON \
+		-DQT_NO_PACKAGE_VERSION_CHECK=TRUE
