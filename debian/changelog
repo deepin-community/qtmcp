@@ -1,5 +1,5 @@
-template-repository (1.0-1) unstable; urgency=medium
+qtmcp (6.10.2-0deepin1) unstable; urgency=medium
 
-  * Initial release
+  * Initial package for qtmcp
 
- -- Tsic404 <liuheng@deepin.org>  Sat, 28 Jan 2023 13:46:49 +0800
+ -- Wang Zichong <wangzichong@deepin.org>  Mon, 20 Jul 2026 15:55:00 +0800
