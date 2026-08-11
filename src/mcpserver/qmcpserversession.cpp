@@ -4,6 +4,7 @@
 #include "qmcpserversession.h"
 #include "qmcpserver.h"
 #include <QtCore/QFutureWatcher>
+#include <QtCore/QJsonArray>
 #include <QtCore/QMultiHash>
 #include <QtCore/QPromise>
 #include <QtCore/QTimer>
@@ -11,14 +12,70 @@
 #include <QtGui/QAction>
 #endif
 #include <QtMcpCommon/QMcpCreateMessageRequest>
+#include <QtMcpCommon/QMcpElicitRequest>
 #include <QtMcpCommon/QMcpProgressNotification>
 
 QT_BEGIN_NAMESPACE
+
+static QString buildParameterErrorMessage(const QString &toolName, const QJsonObject &providedParams, const QMcpToolInputSchema &schema)
+{
+    using namespace Qt::Literals::StringLiterals;
+
+    const auto properties = schema.properties();
+    const auto required = schema.required();
+
+    QStringList supportedParams;
+    for (auto it = properties.begin(); it != properties.end(); ++it) {
+        const auto paramObj = it.value().toObject();
+        const auto type = paramObj.value("type"_L1);
+        QString typeStr;
+        if (type.isString()) {
+            typeStr = type.toString();
+        } else if (type.isArray()) {
+            QStringList types;
+            for (const auto &t : type.toArray())
+                types.append(t.toString());
+            typeStr = types.join("|"_L1);
+        }
+        supportedParams.append("%1: %2%3"_L1.arg(
+            it.key(),
+            typeStr,
+            required.contains(it.key()) ? " (required)"_L1 : " (optional)"_L1));
+    }
+
+    if (supportedParams.isEmpty()) {
+        return "Error: tool '%1' takes no parameters, but received: [%2]"_L1
+            .arg(toolName, providedParams.keys().join(", "_L1));
+    }
+
+    return "Error: parameter mismatch for tool '%1'. "
+           "Provided: [%2]. "
+           "Supported: [%3]"_L1
+        .arg(toolName,
+             providedParams.keys().join(", "_L1),
+             supportedParams.join(", "_L1));
+}
 
 class QMcpServerSession::Private
 {
 public:
     Private(const QUuid &id, QMcpServerSession *parent);
+
+    // *ListChanged notifications are only meaningful once the client has
+    // received an initial list via the corresponding list request, which
+    // can't happen before initialization. Registrations made while setting
+    // up a session (e.g. registerToolSet() called right after construction,
+    // before the client's initialize handshake completes) must not arm the
+    // notification timer: doing so raced the handshake, since the timer
+    // fires on the next event-loop turn regardless of how far the handshake
+    // has progressed by then, occasionally sending a stray notification
+    // between two unrelated responses. The client picks up any pre-init
+    // registrations through its own first list request instead.
+    void notifyChanged(QTimer &timer)
+    {
+        if (initialized)
+            timer.start();
+    }
 
 private:
     QMcpServerSession *q;
@@ -36,6 +93,19 @@ public:
 #endif
     QList<QMcpRoot> roots;
     QMultiHash<QUrl, QUrl> subscriptions;
+
+    bool listenSubscribed = false;
+    QMcpSubscriptionFilter listenFilter;
+    QString listenSubscriptionId;
+
+    QJsonObject inputResponses;
+    QJsonValue clientRequestState;
+    bool inputRequired = false;
+    QJsonObject requiredInputRequests;
+    QJsonValue requiredRequestState;
+
+    QJsonObject clientCapabilities;
+    QJsonObject resultOverride;
 
     QTimer notifyResourceListChanged;
     QTimer notifyPromptListChanged;
@@ -93,6 +163,102 @@ void QMcpServerSession::setProtocolVersion(const QString &protocolVersionStr)
     setProtocolVersion(version);
 }
 
+bool QMcpServerSession::hasListenSubscriptions() const
+{
+    return d->listenSubscribed;
+}
+
+QMcpSubscriptionFilter QMcpServerSession::listenSubscriptions() const
+{
+    return d->listenFilter;
+}
+
+void QMcpServerSession::setListenSubscriptions(const QMcpSubscriptionFilter &filter)
+{
+    d->listenSubscribed = true;
+    d->listenFilter = filter;
+    if (d->listenSubscriptionId.isEmpty())
+        d->listenSubscriptionId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+}
+
+QString QMcpServerSession::listenSubscriptionId() const
+{
+    return d->listenSubscriptionId;
+}
+
+QJsonObject QMcpServerSession::inputResponses() const
+{
+    return d->inputResponses;
+}
+
+QJsonValue QMcpServerSession::clientRequestState() const
+{
+    return d->clientRequestState;
+}
+
+void QMcpServerSession::requireInput(const QJsonObject &inputRequests, const QJsonValue &requestState)
+{
+    if (protocolVersion() < QtMcp::ProtocolVersion::v2026_07_28) {
+        qWarning() << "requireInput() needs MCP 2026-07-28, session uses"
+                   << QtMcp::protocolVersionToString(protocolVersion());
+        return;
+    }
+    d->inputRequired = true;
+    d->requiredInputRequests = inputRequests;
+    d->requiredRequestState = requestState;
+}
+
+QJsonObject QMcpServerSession::elicitationInputRequest(const QMcpElicitRequestParams &params)
+{
+    QJsonObject request;
+    request.insert("method"_L1, "elicitation/create"_L1);
+    request.insert("params"_L1, params.toJsonObject(QtMcp::ProtocolVersion::v2026_07_28));
+    return request;
+}
+
+void QMcpServerSession::provideInputResponses(const QJsonObject &responses, const QJsonValue &requestState)
+{
+    d->inputResponses = responses;
+    d->clientRequestState = requestState;
+    d->inputRequired = false;
+    d->requiredInputRequests = QJsonObject();
+    d->requiredRequestState = QJsonValue();
+}
+
+QJsonObject QMcpServerSession::clientCapabilitiesJson() const
+{
+    return d->clientCapabilities;
+}
+
+void QMcpServerSession::setClientCapabilitiesJson(const QJsonObject &capabilities)
+{
+    d->clientCapabilities = capabilities;
+}
+
+void QMcpServerSession::overrideResult(const QJsonObject &result)
+{
+    d->resultOverride = result;
+}
+
+QJsonObject QMcpServerSession::takeResultOverride()
+{
+    return std::exchange(d->resultOverride, QJsonObject());
+}
+
+bool QMcpServerSession::takeRequiredInput(QJsonObject *inputRequests, QJsonValue *requestState)
+{
+    if (!d->inputRequired)
+        return false;
+    if (inputRequests)
+        *inputRequests = d->requiredInputRequests;
+    if (requestState)
+        *requestState = d->requiredRequestState;
+    d->inputRequired = false;
+    d->requiredInputRequests = QJsonObject();
+    d->requiredRequestState = QJsonValue();
+    return true;
+}
+
 bool QMcpServerSession::isInitialized() const
 {
     return d->initialized;
@@ -128,13 +294,13 @@ void QMcpServerSession::removeResourceTemplateAt(int index)
 void QMcpServerSession::appendResource(const QMcpResource &resource, const QMcpReadResourceResultContents &content)
 {
     d->resources.append(qMakePair(resource, content));
-    d->notifyResourceListChanged.start();
+    d->notifyChanged(d->notifyResourceListChanged);
 }
 
 void QMcpServerSession::insertResource(int index, const QMcpResource &resource, const QMcpReadResourceResultContents &content)
 {
     d->resources.insert(index, qMakePair(resource, content));
-    d->notifyResourceListChanged.start();
+    d->notifyChanged(d->notifyResourceListChanged);
 }
 
 void QMcpServerSession::replaceResource(const QUrl &uri, const QMcpResource resource, const QMcpReadResourceResultContents &content)
@@ -159,7 +325,7 @@ void QMcpServerSession::removeResource(const QUrl &uri)
     for (int i = 0; i < d->resources.count(); ++i) {
         if (d->resources.at(i).first.uri() == uri) {
             d->resources.removeAt(i);
-            d->notifyResourceListChanged.start();
+            d->notifyChanged(d->notifyResourceListChanged);
             break;
         }
     }
@@ -168,7 +334,7 @@ void QMcpServerSession::removeResource(const QUrl &uri)
 void QMcpServerSession::removeResourceAt(int index)
 {
     d->resources.removeAt(index);
-    d->notifyResourceListChanged.start();
+    d->notifyChanged(d->notifyResourceListChanged);
 }
 
 QList<QMcpResourceTemplate> QMcpServerSession::resourceTemplates() const
@@ -225,25 +391,25 @@ QList<QMcpReadResourceResultContents> QMcpServerSession::contents(const QUrl &ur
 void QMcpServerSession::appendPrompt(const QMcpPrompt &prompt, const QMcpPromptMessage &message)
 {
     d->prompts.append(qMakePair(prompt, message));
-    d->notifyPromptListChanged.start();
+    d->notifyChanged(d->notifyPromptListChanged);
 }
 
 void QMcpServerSession::insertPrompt(int index, const QMcpPrompt &prompt, const QMcpPromptMessage &message)
 {
     d->prompts.insert(index, qMakePair(prompt, message));
-    d->notifyPromptListChanged.start();
+    d->notifyChanged(d->notifyPromptListChanged);
 }
 
 void QMcpServerSession::replacePrompt(int index, const QMcpPrompt prompt, const QMcpPromptMessage &message)
 {
     d->prompts.replace(index, qMakePair(prompt, message));
-    d->notifyPromptListChanged.start();
+    d->notifyChanged(d->notifyPromptListChanged);
 }
 
 void QMcpServerSession::removePromptAt(int index)
 {
     d->prompts.removeAt(index);
-    d->notifyPromptListChanged.start();
+    d->notifyChanged(d->notifyPromptListChanged);
 }
 
 QList<QMcpPrompt> QMcpServerSession::prompts(QString *cursor) const
@@ -297,11 +463,11 @@ void QMcpServerSession::registerToolSet(QObject *toolSet, const QHash<QString, Q
     if (!prefix.isEmpty())
         prefix.append('/'_L1);
 
-    // Collect methods grouped by name, picking the overload with the most parameters
-    // and tracking the minimum parameter count to determine which params are required.
-    // Qt MOC generates multiple overloads for methods with default parameter values.
+    // Collect methods grouped by name, keeping all overloads.
+    // Track min parameter count to determine which params are required
+    // (Qt MOC generates multiple overloads for methods with default parameter values).
     struct MethodInfo {
-        QMetaMethod method;
+        QList<QMetaMethod> methods;
         int minParamCount;
     };
     QHash<QString, MethodInfo> methodMap;
@@ -314,23 +480,26 @@ void QMcpServerSession::registerToolSet(QObject *toolSet, const QHash<QString, Q
             continue;
         const auto name = QString::fromUtf8(mm.name());
         if (!methodMap.contains(name)) {
-            methodMap.insert(name, { mm, mm.parameterCount() });
+            methodMap.insert(name, { { mm }, mm.parameterCount() });
         } else {
             auto &info = methodMap[name];
-            if (mm.parameterCount() > info.method.parameterCount()) {
-                info.minParamCount = qMin(info.minParamCount, info.method.parameterCount());
-                info.method = mm;
-            } else {
-                info.minParamCount = qMin(info.minParamCount, mm.parameterCount());
-            }
+            info.minParamCount = qMin(info.minParamCount, mm.parameterCount());
+            info.methods.append(mm);
         }
     }
 
     bool changed = false;
     for (auto it = methodMap.cbegin(); it != methodMap.cend(); ++it) {
         const auto &name = it.key();
-        const auto &mm = it.value().method;
+        const auto &methods = it.value().methods;
         const int minParams = it.value().minParamCount;
+
+        // Pick the overload with the most parameters as the canonical one
+        const QMetaMethod *canonical = &methods.first();
+        for (const auto &m : methods) {
+            if (m.parameterCount() > canonical->parameterCount())
+                canonical = &m;
+        }
 
         QMcpTool tool;
         tool.setName(prefix + name);
@@ -340,32 +509,56 @@ void QMcpServerSession::registerToolSet(QObject *toolSet, const QHash<QString, Q
         QMcpToolInputSchema inputSchema;
         auto required = inputSchema.required();
         auto properties = inputSchema.properties();
-        const auto types = mm.parameterTypes();
-        const auto names = mm.parameterNames();
-        for (int j = 0; j < mm.parameterCount(); j++) {
-            const auto type = QString::fromUtf8(types.at(j));
-            const auto name = QString::fromUtf8(names.at(j));
-            // message
-            QHash<QString, QString> mcpTypes {
-                                             { "QString", "string" },
-                                             { "bool", "boolean" },
-                                             { "int", "integer" },
-                                             };
-            QSet<QString> internalTypes { "QUuid"_L1 };
-            QJsonObject object;
-            if (mcpTypes.contains(type))
-                object.insert("type"_L1, mcpTypes.value(type));
-            else if (internalTypes.contains(type))
-                continue;
-            else
-                qWarning() << "Unknown type" << type;
 
-            if (descriptions.contains("%1/%2"_L1.arg(tool.name(), name))) {
-                object.insert("description"_L1, descriptions.value("%1/%2"_L1.arg(tool.name(), name)));
+        static const QHash<QString, QString> mcpTypes {
+            { "QString"_L1, "string"_L1 },
+            { "bool"_L1, "boolean"_L1 },
+            { "int"_L1, "integer"_L1 },
+            { "double"_L1, "number"_L1 },
+            { "float"_L1, "number"_L1 },
+            { "qreal"_L1, "number"_L1 },
+        };
+        static const QSet<QString> internalTypes { "QUuid"_L1 };
+
+        const auto canonicalTypes = canonical->parameterTypes();
+        const auto canonicalNames = canonical->parameterNames();
+        for (int j = 0; j < canonical->parameterCount(); j++) {
+            const auto paramName = QString::fromUtf8(canonicalNames.at(j));
+
+            // Collect all distinct MCP types for this parameter across overloads
+            QStringList typeSet;
+            for (const auto &m : methods) {
+                if (j >= m.parameterCount())
+                    continue;
+                const auto cppType = QString::fromUtf8(m.parameterTypes().at(j));
+                if (mcpTypes.contains(cppType)) {
+                    const auto mcpType = mcpTypes.value(cppType);
+                    if (!typeSet.contains(mcpType))
+                        typeSet.append(mcpType);
+                }
             }
-            properties.insert(name, object);
+
+            // Fallback to canonical type if no types were collected
+            if (typeSet.isEmpty()) {
+                const auto type = QString::fromUtf8(canonicalTypes.at(j));
+                if (internalTypes.contains(type))
+                    continue;
+                qWarning() << "Unknown type" << type;
+            }
+
+            QJsonObject object;
+            if (typeSet.size() == 1) {
+                object.insert("type"_L1, typeSet.first());
+            } else if (typeSet.size() > 1) {
+                object.insert("type"_L1, QJsonArray::fromStringList(typeSet));
+            }
+
+            if (descriptions.contains("%1/%2"_L1.arg(tool.name(), paramName))) {
+                object.insert("description"_L1, descriptions.value("%1/%2"_L1.arg(tool.name(), paramName)));
+            }
+            properties.insert(paramName, object);
             if (j < minParams)
-                required.append(name);
+                required.append(paramName);
         }
         inputSchema.setProperties(properties);
         inputSchema.setRequired(required);
@@ -374,7 +567,7 @@ void QMcpServerSession::registerToolSet(QObject *toolSet, const QHash<QString, Q
         changed = true;
     }
     if (changed)
-        d->notifyToolListChanged.start();
+        d->notifyChanged(d->notifyToolListChanged);
 }
 
 void QMcpServerSession::unregisterToolSet(const QObject *toolSet)
@@ -387,7 +580,7 @@ void QMcpServerSession::unregisterToolSet(const QObject *toolSet)
         }
     }
     if (changed)
-        d->notifyToolListChanged.start();
+        d->notifyChanged(d->notifyToolListChanged);
 }
 
 #ifdef QT_GUI_LIB
@@ -397,7 +590,7 @@ void QMcpServerSession::registerTool(QAction *action, const QString &name)
     tool.setName(name);
     tool.setDescription(action->toolTip());
     d->actions.append(std::make_pair(tool, action));
-    d->notifyToolListChanged.start();
+    d->notifyChanged(d->notifyToolListChanged);
 }
 
 void QMcpServerSession::unregisterTool(const QAction *action)
@@ -405,7 +598,7 @@ void QMcpServerSession::unregisterTool(const QAction *action)
     for (int i = d->actions.length() - 1; i >= 0; i--) {
         if (d->actions.at(i).second == action) {
             d->actions.removeAt(i);
-            d->notifyToolListChanged.start();
+            d->notifyChanged(d->notifyToolListChanged);
             return;
         }
     }
@@ -445,10 +638,41 @@ T callMethod(QObject *object, const QMetaMethod *method, const QVariantList &arg
                        QGenericArgument(args.at(2).typeName(), args.at(2).constData())
                        );
         break;
+    case 4:
+        method->invoke(object,
+                       ret,
+                       QGenericArgument(args.at(0).typeName(), args.at(0).constData()),
+                       QGenericArgument(args.at(1).typeName(), args.at(1).constData()),
+                       QGenericArgument(args.at(2).typeName(), args.at(2).constData()),
+                       QGenericArgument(args.at(3).typeName(), args.at(3).constData())
+                       );
+        break;
+    case 5:
+        method->invoke(object,
+                       ret,
+                       QGenericArgument(args.at(0).typeName(), args.at(0).constData()),
+                       QGenericArgument(args.at(1).typeName(), args.at(1).constData()),
+                       QGenericArgument(args.at(2).typeName(), args.at(2).constData()),
+                       QGenericArgument(args.at(3).typeName(), args.at(3).constData()),
+                       QGenericArgument(args.at(4).typeName(), args.at(4).constData())
+                       );
+        break;
     default:
         qFatal() << "callMethod: too many parameters, or not implemented in switch.";
     }
     return result;
+}
+
+template<class T>
+void invokeMethod(QObject *object, const QMetaMethod &method, const QVariantList &args, T *result)
+{
+    QVector<void *> argv;
+    argv.reserve(args.size() + 1);
+    argv.append(result);
+    for (const auto &arg : args)
+        argv.append(const_cast<void *>(arg.constData()));
+
+    QMetaObject::metacall(object, QMetaObject::InvokeMetaMethod, method.methodIndex(), argv.data());
 }
 }
 
@@ -471,12 +695,19 @@ QList<QMcpTool> QMcpServerSession::tools(QString *cursor) const
 QList<QMcpCallToolResultContent> QMcpServerSession::callTool(const QString &name, const QJsonObject &params, bool *ok)
 {
     bool found = false;
+    bool toolNameFound = false;
+    QMcpTool matchedTool;
     QList<QMcpCallToolResultContent> ret;
     for (const auto &pair : std::as_const(d->tools)) {
         const auto tool = pair.first;
         // check name first
         if (tool.name() != name)
             continue;
+
+        if (!toolNameFound) {
+            toolNameFound = true;
+            matchedTool = tool;
+        }
 
         QString prefix = pair.second->objectName();
         if (!prefix.isEmpty())
@@ -572,6 +803,25 @@ QList<QMcpCallToolResultContent> QMcpServerSession::callTool(const QString &name
                               QGenericArgument(convertedArgs[2].typeName(), convertedArgs[2].constData())
                               );
                     break;
+                case 4:
+                    mm.invoke(pair.second,
+                              Qt::DirectConnection,
+                              QGenericArgument(convertedArgs[0].typeName(), convertedArgs[0].constData()),
+                              QGenericArgument(convertedArgs[1].typeName(), convertedArgs[1].constData()),
+                              QGenericArgument(convertedArgs[2].typeName(), convertedArgs[2].constData()),
+                              QGenericArgument(convertedArgs[3].typeName(), convertedArgs[3].constData())
+                              );
+                    break;
+                case 5:
+                    mm.invoke(pair.second,
+                              Qt::DirectConnection,
+                              QGenericArgument(convertedArgs[0].typeName(), convertedArgs[0].constData()),
+                              QGenericArgument(convertedArgs[1].typeName(), convertedArgs[1].constData()),
+                              QGenericArgument(convertedArgs[2].typeName(), convertedArgs[2].constData()),
+                              QGenericArgument(convertedArgs[3].typeName(), convertedArgs[3].constData()),
+                              QGenericArgument(convertedArgs[4].typeName(), convertedArgs[4].constData())
+                              );
+                    break;
                 default:
                     qFatal() << "invokeMethodWithJson: too many parameters, or not implemented in switch.";
                 }
@@ -631,12 +881,17 @@ QList<QMcpCallToolResultContent> QMcpServerSession::callTool(const QString &name
 
     if (ok)
         *ok = found;
-    if (!found)
-        qWarning() << name << "not found for " << params;
+    if (!found) {
+        if (toolNameFound) {
+            ret.append(QMcpTextContent(buildParameterErrorMessage(name, params, matchedTool.inputSchema())));
+        } else {
+            qWarning() << name << "not found for " << params;
+        }
+    }
     return ret;
 }
 
-QFuture<QList<QMcpCallToolResultContent>> QMcpServerSession::callToolAsync(
+QFuture<QMcpCallToolResult> QMcpServerSession::callToolAsync(
     const QString &name, const QJsonObject &params, const QVariant &progressToken)
 {
     using namespace Qt::Literals::StringLiterals;
@@ -647,6 +902,7 @@ QFuture<QList<QMcpCallToolResultContent>> QMcpServerSession::callToolAsync(
             continue;
 
         const auto mo = pair.second->metaObject();
+        QMetaMethod canonicalMethod;
         for (int i = mo->methodOffset(); i < mo->methodCount(); ++i) {
             const auto mm = mo->method(i);
             if (mm.methodType() != QMetaMethod::Method)
@@ -661,107 +917,121 @@ QFuture<QList<QMcpCallToolResultContent>> QMcpServerSession::callToolAsync(
             if (!returnTypeName.startsWith("QFuture<"))
                 continue;
 
-            // Build converted arguments
-            QVariantList convertedArgs;
-            for (int j = 0; j < mm.parameterCount(); ++j) {
-                const auto paramName = QString::fromUtf8(mm.parameterNames().at(j));
-                const auto type = mm.parameterMetaType(j);
+            if (!canonicalMethod.isValid() || mm.parameterCount() > canonicalMethod.parameterCount())
+                canonicalMethod = mm;
+        }
 
-                // Handle special parameter types
-                if (type.id() == QMetaType::QUuid) {
-                    convertedArgs.append(d->sessionId);
-                    continue;
-                }
+        if (!canonicalMethod.isValid())
+            continue;
 
-                if (!params.contains(paramName))
-                    break;
+        const auto parameterNames = canonicalMethod.parameterNames();
+        QStringList supportedNames;
+        for (int j = 0; j < canonicalMethod.parameterCount(); ++j) {
+            if (canonicalMethod.parameterMetaType(j).id() != QMetaType::QUuid)
+                supportedNames.append(QString::fromUtf8(parameterNames.at(j)));
+        }
 
-                auto value = params.value(paramName).toVariant();
+        bool hasUnknownParameter = false;
+        for (const auto &paramName : params.keys()) {
+            if (!supportedNames.contains(paramName)) {
+                hasUnknownParameter = true;
+                break;
+            }
+        }
+        if (hasUnknownParameter)
+            break;
+
+        // Build converted arguments for the canonical method. Qt MOC exposes
+        // invokable default arguments as shorter overloads, but MCP passes named
+        // JSON parameters. Use default-constructed values for omitted optional
+        // arguments so sparse optional params such as "order_by" are not dropped.
+        QVariantList convertedArgs;
+        for (int j = 0; j < canonicalMethod.parameterCount(); ++j) {
+            const auto paramName = QString::fromUtf8(parameterNames.at(j));
+            const auto type = canonicalMethod.parameterMetaType(j);
+
+            if (type.id() == QMetaType::QUuid) {
+                convertedArgs.append(d->sessionId);
+                continue;
+            }
+
+            QVariant value(type);
+            if (params.contains(paramName)) {
+                value = params.value(paramName).toVariant();
                 if (!value.convert(type)) {
                     qWarning() << "Failed to convert parameter" << paramName;
                     break;
                 }
-                convertedArgs.append(value);
-            }
-
-            if (convertedArgs.count() != mm.parameterCount())
-                continue;
-
-            // Invoke the method and get the QFuture
-            QFuture<QList<QMcpCallToolResultContent>> resultFuture;
-            QGenericReturnArgument ret(mm.returnMetaType().name(), &resultFuture);
-
-            switch (mm.parameterCount()) {
-            case 0:
-                mm.invoke(pair.second, ret);
-                break;
-            case 1:
-                mm.invoke(pair.second, ret,
-                          QGenericArgument(convertedArgs[0].typeName(), convertedArgs[0].constData()));
-                break;
-            case 2:
-                mm.invoke(pair.second, ret,
-                          QGenericArgument(convertedArgs[0].typeName(), convertedArgs[0].constData()),
-                          QGenericArgument(convertedArgs[1].typeName(), convertedArgs[1].constData()));
-                break;
-            default:
-                qWarning() << "callToolAsync: too many parameters";
+            } else if (tool.inputSchema().required().contains(paramName)) {
                 break;
             }
-
-            // Set up progress monitoring if progressToken is provided
-            if (progressToken.isValid() && !progressToken.isNull()) {
-                auto *watcher = new QFutureWatcher<QList<QMcpCallToolResultContent>>(this);
-                auto *server = qobject_cast<QMcpServer *>(parent());
-
-                connect(watcher, &QFutureWatcherBase::progressValueChanged, this,
-                        [this, server, progressToken](int value) {
-                    if (!server)
-                        return;
-                    QMcpProgressNotificationParams params;
-                    params.setProgressToken(progressToken);
-                    params.setProgress(value);
-                    QMcpProgressNotification notification;
-                    notification.setParams(params);
-                    server->notify(d->sessionId, notification);
-                });
-
-                connect(watcher, &QFutureWatcherBase::progressRangeChanged, this,
-                        [this, server, progressToken](int min, int max) {
-                    Q_UNUSED(min);
-                    if (!server)
-                        return;
-                    QMcpProgressNotificationParams params;
-                    params.setProgressToken(progressToken);
-                    params.setProgress(0);
-                    params.setTotal(max);
-                    QMcpProgressNotification notification;
-                    notification.setParams(params);
-                    server->notify(d->sessionId, notification);
-                });
-
-                connect(watcher, &QFutureWatcherBase::finished, watcher, &QObject::deleteLater);
-                watcher->setFuture(resultFuture);
-            }
-
-            return resultFuture;
+            convertedArgs.append(value);
         }
+
+        if (convertedArgs.count() != canonicalMethod.parameterCount())
+            break;
+
+        // Invoke the method and get the QFuture.
+        QFuture<QList<QMcpCallToolResultContent>> resultFuture;
+        invokeMethod(pair.second, canonicalMethod, convertedArgs, &resultFuture);
+
+        // Progress notifications were previously wired up via QFutureWatcher,
+        // but its progressValueChanged/progressRangeChanged signals are
+        // emitted from the event loop *after* the call to setFuture(), and
+        // include a trailing notification once the future finishes. That
+        // trailing notification lands on the client after the tool response
+        // has been delivered, at which point strict clients (Claude Code)
+        // have already resolved the progress token and close the STDIO
+        // session when they see a notification for an unknown token.
+        //
+        // Until we expose an explicit progress reporting API that tools can
+        // drive synchronously, simply drop the progressToken: MCP allows the
+        // server to omit progress notifications, and no current tool emits
+        // meaningful progress anyway.
+        Q_UNUSED(progressToken);
+
+        return resultFuture.then([](const QList<QMcpCallToolResultContent> &content) {
+            QMcpCallToolResult result;
+            result.setContent(content);
+            return result;
+        });
     }
 
     // If no async tool found, try sync callTool and wrap result
     bool ok = false;
     auto syncResult = callTool(name, params, &ok);
     if (ok) {
-        QPromise<QList<QMcpCallToolResultContent>> promise;
+        QPromise<QMcpCallToolResult> promise;
         promise.start();
-        promise.addResult(syncResult);
+        QMcpCallToolResult result;
+        result.setContent(syncResult);
+        promise.addResult(result);
         promise.finish();
         return promise.future();
     }
 
-    // Return empty/canceled future if tool not found
-    QPromise<QList<QMcpCallToolResultContent>> promise;
+    // callTool may have returned error content (tool name found but params wrong)
+    if (!syncResult.isEmpty()) {
+        QPromise<QMcpCallToolResult> promise;
+        promise.start();
+        QMcpCallToolResult result;
+        result.setContent(syncResult);
+        result.setIsError(true);
+        promise.addResult(result);
+        promise.finish();
+        return promise.future();
+    }
+
+    // Tool truly not found
+    QPromise<QMcpCallToolResult> promise;
     promise.start();
+    QMcpCallToolResult result;
+    QList<QMcpCallToolResultContent> errorContent;
+    errorContent.append(QMcpCallToolResultContent(QMcpTextContent(
+        "Error: tool '%1' not found"_L1.arg(name))));
+    result.setContent(errorContent);
+    result.setIsError(true);
+    promise.addResult(result);
     promise.finish();
     return promise.future();
 }
@@ -821,11 +1091,39 @@ void QMcpServerSession::createMessage(const QMcpCreateMessageRequestParams &para
     auto server = qobject_cast<QMcpServer *>(parent());
     if (!server)
         return;
+    if (protocolVersion() >= QtMcp::ProtocolVersion::v2026_07_28) {
+        qWarning() << "sampling/createMessage was removed in MCP 2026-07-28;"
+                   << "return an input_required result (MRTR) instead";
+        return;
+    }
     QMcpCreateMessageRequest request;
     request.setParams(params);
-    server->request(d->sessionId, request, [this, server](const QUuid &sessionId, const QMcpCreateMessageResult &result) {
+    server->request(d->sessionId, request, [this](const QUuid &sessionId, const QMcpCreateMessageResult &result) {
         Q_ASSERT(d->sessionId == sessionId);
         emit createMessageFinished(result);
+    });
+}
+
+void QMcpServerSession::elicit(const QMcpElicitRequestParams &params)
+{
+    auto server = qobject_cast<QMcpServer *>(parent());
+    if (!server)
+        return;
+    if (protocolVersion() < QtMcp::ProtocolVersion::v2025_06_18) {
+        qWarning() << "elicitation/create requires MCP 2025-06-18 or later, session uses"
+                   << QtMcp::protocolVersionToString(protocolVersion());
+        return;
+    }
+    if (protocolVersion() >= QtMcp::ProtocolVersion::v2026_07_28) {
+        qWarning() << "elicitation/create was removed in MCP 2026-07-28;"
+                   << "return an input_required result (MRTR) instead";
+        return;
+    }
+    QMcpElicitRequest request;
+    request.setParams(params);
+    server->request(d->sessionId, request, [this](const QUuid &sessionId, const QMcpElicitResult &result) {
+        Q_ASSERT(d->sessionId == sessionId);
+        emit elicitFinished(result);
     });
 }
 

@@ -69,5 +69,19 @@ Description: Qt 6 MCP - development files
  providing a robust framework for communication between clients and servers
  in model-driven applications.
  .
- This package contains the header files, CMake configuration files, and
- symbolic links needed for developing applications that use Qt MCP.
+  This package contains the header files, CMake configuration files, and
+  symbolic links needed for developing applications that use Qt MCP.
+
+Package: qtmcp-examples
+Architecture: any
+Multi-Arch: no
+Depends: ${shlibs:Depends},
+         ${misc:Depends}
+Description: Qt 6 MCP examples
+  Qt MCP is a Qt-based implementation of the Model Context Protocol (MCP),
+  providing a robust framework for communication between clients and servers
+  in model-driven applications.
+  .
+  This package contains example programs demonstrating the MCP client and
+  server libraries, including the interactive client inspector and several
+  example servers.

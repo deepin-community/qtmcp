@@ -58,10 +58,13 @@ void QMcpServerStdio::Private::readData(QSocketDescriptor socket, QSocketNotifie
     const auto bytesRead = ::read(STDIN_FILENO, buffer, sizeof(buffer));
     if (bytesRead < 0) {
         std::perror("Error reading STDIN");
+        notifier->setEnabled(false);
+        emit q->finished();
         return;
     }
     if (bytesRead == 0) {
         // EOF reached (no more data)
+        notifier->setEnabled(false);
         emit q->finished();
         return;
     }
@@ -119,7 +122,7 @@ void QMcpServerStdio::send(const QUuid &session, const QJsonObject &object)
 {
     Q_UNUSED(session)
     const auto data = QJsonDocument(object).toJson(QJsonDocument::Compact);
-    qDebug() << data;
+    qCDebug(lcQMcpServerStdioPlugin) << data;
     std::cout << data.toStdString() << std::endl;
 }
 

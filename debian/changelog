@@ -1,3 +1,10 @@
+qtmcp (2026.7.28-0deepin1) unstable; urgency=medium
+
+  * Update to v2026.7.28
+  * Add qtmcp-examples package
+
+ -- Wang Zichong <wangzichong@deepin.org>  Tue, 11 Aug 2026 10:22:00 +0800
+
 qtmcp (6.10.2-0deepin1) unstable; urgency=medium
 
   * Initial package for qtmcp
