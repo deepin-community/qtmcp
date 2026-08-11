@@ -1,6 +1,7 @@
 usr/include/*/qt6/QtMcp*
 usr/lib/*/cmake/Qt6BuildInternals/StandaloneTests/QtMcpTestsConfig.cmake
 usr/lib/*/cmake/Qt6Mcp*
+usr/lib/*/cmake/QtMcp*
 usr/lib/*/libQt6Mcp*.prl
 usr/lib/*/libQt6Mcp*.so
 usr/lib/*/qt6/metatypes/qt6mcp*

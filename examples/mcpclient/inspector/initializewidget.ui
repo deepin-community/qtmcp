@@ -67,6 +67,27 @@
           <property name="text">
            <string>2025-03-26</string>
           </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QRadioButton" name="clientProtocolVersion20250618">
+          <property name="text">
+           <string>2025-06-18</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QRadioButton" name="clientProtocolVersion20251125">
+          <property name="text">
+           <string>2025-11-25</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QRadioButton" name="clientProtocolVersion20260728">
+          <property name="text">
+           <string>2026-07-28</string>
+          </property>
           <property name="checked">
            <bool>true</bool>
           </property>
